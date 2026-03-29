@@ -1,0 +1,301 @@
+================================================================
+NEXUSCORE BACKEND - FULL CODE EXPLANATION
+================================================================
+
+
+THE TWO ENDPOINTS
+-----------------
+You have two files that handle the AI chat:
+
+- chat.py            -> powers the FAQPage (POST /chat)
+                        user types a question, no game context required
+
+- community_search.py -> powers the GameSupportPage (POST /community/chat)
+                         game name is always known upfront from the URL param
+
+Both files are nearly identical in logic. The difference: chat.py extracts
+the game name FROM the question itself, while community_search.py receives
+game_name directly as a separate field.
+
+
+================================================================
+STEP-BY-STEP REQUEST FLOW
+================================================================
+
+When a user sends a question, here is exactly what happens:
+
+
+STEP 1 - Extract & Normalize the Game Name
+-------------------------------------------
+    game_name = await extract_game_name(request.question)
+
+Sends the question to GPT-4o-mini with the instruction:
+"expand abbreviations to full official titles"
+
+Examples:
+    "warhammer 3"  ->  "Total War: Warhammer III"
+    "fifa 24"      ->  "EA Sports FC 24"
+    "elden ring"   ->  "Elden Ring"
+
+This is critical because RAWG, Steam, and Reddit all need the exact title.
+
+
+STEP 2 - Is it a Franchise or a Single Game?
+---------------------------------------------
+    franchise = await is_franchise(game_name)
+
+Another GPT-4o-mini call. Asks: "Is this a broad franchise with no
+specific installment?"
+
+Examples:
+    "Call of Duty"              -> yes (franchise)
+    "Call of Duty: Black Ops 6" -> no  (single game)
+    "Warhammer"                 -> yes
+    "Total War: Warhammer III"  -> no
+
+Why this matters: If franchise, RAWG returns the top 5 games in that
+series. If single game, RAWG returns exactly 1.
+
+
+STEP 3 - Fetch Game Info from RAWG
+------------------------------------
+    game_info = await get_rawg_game_info(game_name)
+
+Hits https://api.rawg.io/api/games with the game name as a search query.
+
+For a SINGLE GAME it does two requests:
+    1. Search -> gets the game's slug (e.g. "the-witcher-3-wild-hunt")
+    2. Detail fetch on https://api.rawg.io/api/games/{slug}
+       -> gets the stores list, which includes the Steam store URL like
+          https://store.steampowered.com/app/292030/
+
+It then parses the 292030 out of that URL as the Steam App ID.
+
+Returns: name, release date, rating, Metacritic score, genres, platforms,
+Steam App ID.
+
+For a FRANCHISE it just returns basic info for all 5 games (no detail fetch).
+
+
+================================================================
+STEP 4 - Branch by Category
+================================================================
+
+This is where the logic splits based on what the user selected.
+
+
+----------------------------------------------------------------
+CATEGORY: updates  ->  Steam Integration
+----------------------------------------------------------------
+
+    steam_id = await resolve_steam_app_id(game_name, rawg_slug)
+    news = await get_steam_news(steam_id)
+
+resolve_steam_app_id - 2-method fallback system:
+
+    METHOD 1 (preferred):
+        Use the RAWG detail endpoint's stores list to find the Steam URL
+        store.steampowered.com/app/{id} directly. Most reliable.
+
+    METHOD 2 (fallback):
+        Hit Steam's search suggest endpoint:
+        https://store.steampowered.com/search/suggest?term=Witcher+3&f=games
+
+        This returns an HTML autocomplete dropdown (NOT JSON).
+        So we parse it with regex:
+            re.search(r'data-ds-appid="(\d+)"', r.text)
+        That attribute is embedded in the HTML and gives us the App ID.
+
+get_steam_news - hits the free Steam Web API (no API key needed):
+    https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=292030
+
+Returns the official patch notes, changelogs, and announcements posted
+by the developer on Steam.
+
+strip_html() cleans out all HTML/BBCode tags from the news content before
+feeding it to GPT.
+
+For franchises, all Steam news fetches run IN PARALLEL using
+asyncio.gather() - fetches news for all 5 games at once.
+
+
+----------------------------------------------------------------
+CATEGORIES: gameplay, technical, community, general  ->  Reddit
+----------------------------------------------------------------
+
+These categories pull from Reddit because the best answers come from
+real community discussion.
+
+STEP A - Find the right subreddit:
+    subreddit = await get_game_subreddit(resolved_name)
+
+    GPT-4o-mini call: "What is the most game-specific subreddit?"
+        "The Witcher 3"  ->  witcher3   (not "witcher" which mixes with Netflix)
+        "GTA 5"          ->  gtaonline
+        "Elden Ring"     ->  Eldenring
+
+STEP B - Extract search keywords:
+    search_keywords = await extract_search_keywords(request.question)
+
+    Another GPT-4o-mini call. Strips the game name and converts the
+    question into Reddit search terms. Always appends "game" to avoid
+    returning Netflix/movie results:
+        "witcher 3 review"      ->  "game review"
+        "best build elden ring" ->  "best build game"
+        "lore explained"        ->  "game lore"
+
+STEP C - fetch_reddit_posts - 3-tier fallback:
+
+    TIER 1: r/{subreddit}/search.json?q=game+review&sort=top&t=all
+        Searches within the specific subreddit for the keywords, sorted
+        by all-time top upvotes. Uses a full Chrome browser User-Agent
+        to bypass Reddit's Cloudflare bot detection. Best option -
+        returns keyword-relevant posts with real upvote scores.
+
+    TIER 2: r/{subreddit}/top.json?t=all
+        If search is blocked, get all-time top posts from the subreddit
+        and filter them client-side by keyword tokens.
+
+    TIER 3: r/{subreddit}/hot.json
+        Last resort - current trending posts in the subreddit.
+
+    _parse_reddit_children() processes whichever tier succeeded:
+        - Extracts: title, url, score, selftext (capped at 2000 chars),
+          num_comments
+        - Filters out [deleted] and [removed] posts
+        - Sorts by score descending (highest upvotes first)
+
+STEP D - Keyword filter on the 25 returned posts:
+    relevant = [p for p in posts if keyword in p["title"] or p["selftext"]]
+    posts = relevant[:5] if relevant else posts[:5]
+
+    Takes 25 posts back from Reddit, filters to only those whose
+    title/body actually contains the keyword tokens (e.g. "review",
+    "build"). Keeps top 5. This prevents viral unrelated posts from
+    appearing (like "playing witcher healed my relationship with my mom").
+
+STEP E - Store to ChromaDB:
+    store_posts_to_chromadb(posts, game_name, category)
+
+    The 5 Reddit posts get converted to text (title + selftext) and
+    stored as vector embeddings in ChromaDB, tagged with:
+    game, category, subreddit, score, url.
+
+STEP F - Semantic search ChromaDB:
+    docs = vector_db.similarity_search(request.question, k=5, filter=...)
+
+    Does a semantic similarity search of the user's question against
+    everything stored for that game+category. This finds the most
+    meaning-relevant chunks. ChromaDB converts both the question and the
+    stored posts into vectors and finds the closest ones mathematically.
+    Different from keyword search - "how do I kill the boss" can match
+    "boss fight strategy guide" even with different words.
+
+
+----------------------------------------------------------------
+CATEGORIES: account, billing  ->  No Reddit
+----------------------------------------------------------------
+
+These categories only use RAWG platform info + GPT's own training
+knowledge. No Reddit because billing/account questions are
+platform-specific (Steam, GOG, PlayStation) and Reddit rarely has
+accurate, up-to-date info on those topics.
+
+
+================================================================
+STEP 5 - Build the Final GPT-4o Prompt
+================================================================
+
+All collected context (RAWG info + Steam news OR Reddit posts) is
+assembled into one block:
+    context = "\n\n---\n\n".join(context_parts)
+
+The system prompt is picked from CATEGORY_PROMPTS - each category has
+a strict persona with explicit instructions to reject off-topic questions:
+    gameplay  -> "You are a gameplay expert. ONLY answer about mechanics..."
+    technical -> "You are a technical support specialist. ONLY answer about crashes..."
+    billing   -> "You are a billing specialist. ONLY answer about pricing..."
+    etc.
+
+IS_JUST_GAME_NAME FIX:
+    If the user types just "witcher 3" or "elden ring" (1-2 words), the
+    system replaces it with a full intent-based question:
+        gameplay category -> "What are the gameplay mechanics, tips, or
+                              strategies for The Witcher 3?"
+    Because sending just a game name to GPT produces a useless generic response.
+
+MULTI-TURN CHAT HISTORY:
+    openai_messages = [{"role": "system", ...}]
+    for msg in request.messages:          # all previous turns
+        openai_messages.append(...)
+    openai_messages.append({"role": "user", "content": final_question})
+
+    The entire conversation history is injected before the current question.
+    This is how follow-up questions work - GPT sees the full conversation
+    and can answer "what about the price in Southeast Asia?" after already
+    discussing the base game price.
+
+
+================================================================
+STEP 6 - Return Response
+================================================================
+
+chat.py returns:
+    { "answer": "...", "sources": [] }
+    (sources empty - Reddit posts not shown on FAQPage)
+
+community_search.py returns:
+    { "answer": "...", "posts": [...] }
+    (actual Reddit post objects sent to frontend so users can click
+     and read the original Reddit threads)
+
+
+================================================================
+SUMMARY TABLE
+================================================================
+
+What                  | How                            | Why
+----------------------|--------------------------------|---------------------------
+Game name normalize   | GPT-4o-mini                    | "warhammer 3" is useless
+Franchise detection   | GPT-4o-mini                    | Changes RAWG fetch strategy
+Game metadata         | RAWG API                       | Platforms, rating, genres
+Steam App ID          | RAWG stores -> Steam HTML      | Two fallbacks, no key needed
+Patch notes           | Steam ISteamNews API           | Official, real-time, free
+Subreddit targeting   | GPT-4o-mini                    | Search the right community
+Reddit keywords       | GPT-4o-mini                    | Game name excluded from query
+Reddit fetch          | search -> top -> hot (Chrome UA)| Bypass Cloudflare, 3 fallbacks
+Relevance filter      | Keyword token matching          | Block viral off-topic posts
+Semantic memory       | ChromaDB vector search          | Meaning-based not keyword-based
+Answer generation     | GPT-4o                         | Combines all context
+Multi-turn chat       | OpenAI messages array           | Full conversation history
+
+
+================================================================
+EXTERNAL APIS USED
+================================================================
+
+RAWG API          - https://api.rawg.io/api/games
+                    Requires RAWG_API_KEY in .env
+                    Used for: game metadata, Steam slug lookup
+
+Steam ISteamNews  - https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/
+                    FREE - no key required
+                    Used for: official patch notes and updates
+
+Steam Suggest     - https://store.steampowered.com/search/suggest
+                    FREE - no key required, returns HTML
+                    Used for: fallback Steam App ID lookup
+
+Reddit JSON API   - https://www.reddit.com/r/{sub}/search.json
+                    No key required, uses browser User-Agent
+                    Used for: community posts, guides, reviews
+
+OpenAI GPT-4o     - Requires OPENAI_API_KEY in .env
+                    Used for: final answer generation
+
+OpenAI GPT-4o-mini - Requires OPENAI_API_KEY in .env
+                     Used for: game name extraction, franchise detection,
+                               subreddit lookup, keyword extraction
+
+ChromaDB          - Running locally via Docker on port 8001
+                    Used for: storing and searching Reddit posts as vectors

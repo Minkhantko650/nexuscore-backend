@@ -1,0 +1,28 @@
+WHY SECRET_KEY IS NEEDED
+=========================
+
+The SECRET_KEY is used to sign and verify JWT tokens.
+
+Flow:
+1. User logs in → server creates a JWT token and signs it with SECRET_KEY
+2. User sends the token back with future requests
+3. Server uses the same SECRET_KEY to verify the token is genuine and wasn't tampered with
+
+Without it, anyone could fake a token and pretend to be any user.
+
+The SECRET_KEY should be:
+- Long and random (we generated a 64-character hex string)
+- Stored in .env (never hardcoded)
+- Never shared publicly
+
+
+WHERE SECRET_KEY IS USED IN auth.py
+=====================================
+
+Functions:
+- create_access_token  → uses SECRET_KEY to SIGN the token when creating it
+- get_current_user     → uses SECRET_KEY to VERIFY the token when a user sends it
+
+Endpoints that use those functions:
+- POST /auth/login  → calls create_access_token → signs token with SECRET_KEY
+- GET  /auth/me     → calls get_current_user    → verifies token with SECRET_KEY

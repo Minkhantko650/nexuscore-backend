@@ -1,0 +1,46 @@
+## Project: project2 (FastAPI RAG + Auth)
+
+Location: D:\2_16_2026_FastAPI_Project\project2
+
+## Stack
+- FastAPI
+- ChromaDB (vector DB for RAG)
+- PostgreSQL (user auth DB)
+- SQLAlchemy ORM
+- OpenAI (embeddings + chat)
+- Docker Compose
+
+## Files
+- main.py - FastAPI app entry point, loads env, creates DB tables, includes routers
+- chat.py - /chat endpoint (RAG with OpenAI)
+- database.py - SQLAlchemy engine, SessionLocal, Base, get_db()
+- models.py - User table model
+- auth.py - (IN PROGRESS) register + login endpoints
+- docker-compose.yml - ChromaDB (port 8001) + PostgreSQL (port 5432)
+- .env - OPENAI_API_KEY, DATABASE_URL
+
+## Docker Services
+- ChromaDB: port 8001
+- PostgreSQL: port 5432, user=myuser, db=mydb
+
+## Auth Plan (in progress)
+- Step 1: Added PostgreSQL to docker-compose.yml DONE
+- Step 2: Added DATABASE_URL to .env DONE
+- Step 3: Created database.py DONE
+- Step 4: Created models.py (User table) DONE
+- Step 5: Added Base.metadata.create_all in main.py DONE
+- Step 6: Create auth.py with register + login endpoints (NEXT)
+
+## Key Decisions
+- Base is defined in database.py, imported by models.py
+- main.py imports both database and models, calls Base.metadata.create_all
+- Avoids circular imports
+- Passwords hashed with bcrypt (passlib)
+- Auth uses JWT tokens (python-jose)
+
+## Packages needed (not yet in requirements.txt)
+- sqlalchemy
+- psycopg2-binary
+- passlib[bcrypt]
+- python-jose[cryptography]
+- python-multipart

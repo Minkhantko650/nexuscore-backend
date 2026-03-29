@@ -1,0 +1,421 @@
+================================================================================
+  NEXUSCORE GAMING SUPPORT CHATBOT - CODE SUMMARY & EXPLANATION
+  Project: D:\2_16_2026_FastAPI_Project\project2
+  Frontend: D:\frontend\src
+================================================================================
+
+This document explains every file that was created or modified to build the
+AI-powered gaming support chatbot system. The system uses:
+  - RAWG API: game metadata (genre, rating, platforms, release date)
+  - Reddit public API: community discussions and Q&A
+  - Steam Store Search API: get Steam App IDs from game names
+  - Steam News API: official patch notes and update announcements
+  - ChromaDB: vector database that caches Reddit posts for fast retrieval
+  - OpenAI gpt-4o-mini: extract game names, detect franchises
+  - OpenAI gpt-4o: generate final answers from all sources
+  - FastAPI: backend REST API
+  - React + TypeScript: frontend UI
+
+================================================================================
+  BACKEND FILES
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: main.py
+--------------------------------------------------------------------------------
+PURPOSE:
+  Entry point for the FastAPI application. Sets up ChromaDB, OpenAI embeddings,
+  CORS middleware, database tables, and registers all routers including the new
+  community_search router.
+
+KEY PARTS:
+
+  load_dotenv()
+    Loads environment variables from .env (OPENAI_API_KEY, RAWG_API_KEY,
+    DATABASE_URL, etc.) before anything else runs.
+
+  Base.metadata.create_all(bind=engine)
+    Creates PostgreSQL tables (e.g. users) on startup if they don't exist yet.
+
+  embedding_model = OpenAIEmbeddings(model="text-embedding-3-large")
+    The OpenAI embedding model used to convert text into vectors for ChromaDB.
+    text-embedding-3-large gives high-quality semantic embeddings.
+
+  vector_db = Chroma(client=chromadb.HttpClient(...), ...)
+    Connects to ChromaDB running on localhost:8001 (via Docker).
+    This is the shared vector database used by both chat.py and community_search.py.
+    It stores Reddit posts as vector embeddings so similarity search can find
+    relevant posts for future queries without hitting Reddit again.
+
+  app.include_router(community_router)
+    Registers the community_search router, which adds the /community/chat endpoint.
+
+  @app.post("/upload-pdf")
+    Allows uploading PDF files which get chunked and stored in ChromaDB.
+    This was the original RAG pipeline before the Reddit integration.
+
+  @app.post("/reset-db")
+    Clears the entire ChromaDB collection. Useful for testing.
+
+--------------------------------------------------------------------------------
+FILE: chat.py
+--------------------------------------------------------------------------------
+PURPOSE:
+  Powers the FAQ page chatbot at POST /chat.
+  The user types a question (which may contain the game name), the system extracts
+  the game name, fetches data from multiple sources based on category, then
+  generates an AI answer.
+
+KEY PARTS:
+
+  CATEGORY_PROMPTS (dict)
+    System prompts for each category that enforce strict topic boundaries.
+    Each prompt tells the AI to ONLY answer within that category and to redirect
+    if the question is off-topic. The "updates" prompt is softer — it tells the
+    AI to use its own training knowledge if no Steam news is found.
+
+  REDDIT_CATEGORIES = {"gameplay", "technical", "community", "general"}
+    These categories use Reddit + ChromaDB as their knowledge source.
+
+  OFFICIAL_ONLY_CATEGORIES = {"account", "billing"}
+    These categories rely only on RAWG game metadata + OpenAI's own knowledge.
+    No Reddit is fetched for account/billing since Reddit rarely has accurate
+    official policy information.
+
+  async def extract_game_name(question: str) -> str
+    Sends the full user question to gpt-4o-mini and asks it to extract just
+    the game or franchise name. This is critical because sending the full question
+    directly to RAWG returned wrong results (e.g. "how do i make an account in
+    witcher 3" returned "How To Make Your Grandpa Happy" from RAWG search).
+
+  async def is_franchise(name: str) -> bool
+    Asks gpt-4o-mini if the extracted name is a franchise (e.g. "Warhammer",
+    "Call of Duty") rather than a single specific game title. Returns True/False.
+
+  async def get_rawg_game_info(game_name: str) -> dict | list
+    If is_franchise is True: fetches top 5 games from RAWG matching the name,
+    returns a list of game dicts.
+    If is_franchise is False: fetches 1 game, returns a single dict.
+    Each game dict contains: name, released, rating, metacritic, genres, platforms.
+
+  async def get_steam_app_id(game_name: str) -> int | None
+    Searches Steam Store for the game and returns its numeric App ID.
+    Uses a browser-like User-Agent header because Steam blocks custom user agents.
+    Wrapped in try/except — returns None if the request fails, so the system
+    gracefully falls back to "no Steam news available".
+
+  def strip_html(text: str) -> str
+    Steam news articles contain HTML tags (<b>, <br>, etc.) and BBCode ({STEAM_CLAN_IMAGE}).
+    This function strips them with regex so the text sent to OpenAI is clean.
+
+  async def get_steam_news(app_id: int, detailed: bool = False) -> list[dict]
+    Fetches news articles from Steam's News API for a given app ID.
+    Uses maxlength=0 to get full article content (not truncated).
+    If detailed=True (user asked for "patch notes", "full changelog" etc.),
+    fetches 3 articles with full content. Otherwise fetches 5 brief articles.
+
+  async def fetch_reddit_posts(query: str, limit: int = 5) -> list[dict]
+    Searches Reddit's public JSON API for posts matching the query.
+    Returns: id, title, subreddit, score, url, selftext (first 500 chars), num_comments.
+    No API key needed — uses Reddit's public search endpoint.
+
+  def store_posts_to_chromadb(posts, game_name, category)
+    Stores Reddit posts as text embeddings in ChromaDB with metadata:
+      game: lowercased game name (for filtering)
+      category: the query category (gameplay, technical, etc.)
+      subreddit: where the post came from
+      url: link to original post
+      score: Reddit upvotes
+      source: "reddit"
+    Uses try/except because ChromaDB raises an error if an ID already exists.
+    This builds a self-growing knowledge cache — the more users ask, the more
+    posts are stored, and future queries can be answered from ChromaDB alone.
+
+  @router.post("/chat") — main endpoint logic:
+    1. Extract game name from question using gpt-4o-mini
+    2. Detect if it's a franchise using gpt-4o-mini
+    3. Fetch RAWG game info (1 or 5 results depending on franchise)
+    4. Build context_parts list:
+       - Always include RAWG game info as context
+       - If category == "updates": fetch Steam App IDs in parallel (asyncio.gather),
+         then fetch Steam news for each app ID in parallel
+       - If category in REDDIT_CATEGORIES: fetch Reddit posts, store to ChromaDB,
+         then similarity search ChromaDB for the most relevant posts
+       - If category in OFFICIAL_ONLY_CATEGORIES (account/billing): only RAWG
+         metadata is used — no Reddit, no Steam news
+    5. CATEGORY_INTENTS: if the user just typed a bare game name (e.g. "witcher 3")
+       without a real question, reframe it into a category-specific question
+       (e.g. "What are the latest updates and patch notes for The Witcher 3?")
+    6. Call gpt-4o with the system prompt and all context to generate the answer
+
+--------------------------------------------------------------------------------
+FILE: community_search.py
+--------------------------------------------------------------------------------
+PURPOSE:
+  Powers the GameSupportPage chatbot at POST /community/chat.
+  Very similar to chat.py, but here the game_name is provided explicitly by the
+  frontend (from the URL parameter) rather than extracted from the question.
+  This makes sense because the user already selected a specific game before asking.
+
+DIFFERENCE FROM chat.py:
+  - Request model is CommunityChatRequest(question, game_name, category)
+  - game_name comes from the request body (the game the user clicked "Get Support" on)
+  - extract_game_name() is called on game_name (not question) to clean it up
+  - max_tokens in the OpenAI call is 1024 (chat.py uses 4096)
+  - All other logic (franchise detection, RAWG, Reddit, ChromaDB, Steam) is identical
+
+KEY PARTS: (same as chat.py — see above for detailed explanations)
+  - CATEGORY_PROMPTS: same strict category enforcement
+  - REDDIT_CATEGORIES = {"gameplay", "technical", "community", "general"}
+  - extract_game_name, is_franchise, get_rawg_game_info: identical
+  - get_steam_app_id, strip_html, get_steam_news: identical
+  - fetch_reddit_posts, store_posts_to_chromadb: identical
+  - /community/chat endpoint: same pipeline but uses request.game_name as input
+
+WHY A SEPARATE FILE:
+  Originally CATEGORY_PROMPTS was imported from chat.py, but chat.py imports
+  from main.py (vector_db), which would cause a circular import. Defining
+  everything directly in community_search.py avoids that issue.
+
+--------------------------------------------------------------------------------
+FILE: .env (additions)
+--------------------------------------------------------------------------------
+  RAWG_API_KEY=f12355485f864f89831bf74f64c288e2
+
+  The RAWG API is free and doesn't require any sign-up approval.
+  It provides game metadata: name, release date, rating, Metacritic score,
+  genres, and platforms. No rate limit issues for development use.
+
+--------------------------------------------------------------------------------
+FILE: requirements.txt (additions)
+--------------------------------------------------------------------------------
+  httpx
+
+  httpx is an async HTTP client for Python, used instead of requests because
+  FastAPI endpoints are async. It supports async context managers (async with)
+  and asyncio.gather for parallel HTTP calls. Used to call:
+    - RAWG API
+    - Reddit API
+    - Steam Store Search API
+    - Steam News API
+
+================================================================================
+  FRONTEND FILES
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: src/api.ts
+--------------------------------------------------------------------------------
+PURPOSE:
+  Centralized API client. All fetch calls to the backend go through this file.
+
+KEY ADDITIONS:
+
+  export async function communityChat(question, game_name, category?)
+    Calls POST /community/chat (the community_search.py endpoint).
+    Sends: question (what the user typed), game_name (from URL), category (selected chip).
+    Used by GameSupportPage.
+
+  export async function chat(question, category?)
+    Calls POST /chat (the chat.py endpoint).
+    Sends: question, top_k: 5, category.
+    Used by FAQPage.
+
+  Both functions include the JWT auth token from localStorage in the
+  Authorization header, so the backend can verify the user is logged in.
+
+--------------------------------------------------------------------------------
+FILE: src/App.tsx
+--------------------------------------------------------------------------------
+PURPOSE:
+  React Router configuration. Defines all routes in the app.
+
+KEY ADDITION:
+  import { GameSupportPage } from './pages/GameSupportPage';
+  <Route path="/games/:gameName/support" element={<PrivateRoute><GameSupportPage /></PrivateRoute>} />
+
+  The :gameName URL parameter is the game name (URL-encoded).
+  Wrapped in PrivateRoute so only logged-in users can access it.
+
+--------------------------------------------------------------------------------
+FILE: src/pages/GamesPage.tsx
+--------------------------------------------------------------------------------
+PURPOSE:
+  Displays a grid of top-rated games fetched directly from RAWG API (frontend).
+  When the user clicks a game card, they navigate to the GameSupportPage for that game.
+
+KEY PARTS:
+
+  const RAWG_KEY = import.meta.env.VITE_RAWG_API_KEY
+    RAWG API key from Vite environment variables (.env in frontend root).
+
+  fetch(`https://api.rawg.io/api/games?key=${RAWG_KEY}&page_size=18&ordering=-rating&metacritic=80,100`)
+    Fetches 18 top-rated games with Metacritic score between 80-100.
+    Ordered by highest rating first.
+
+  onClick={() => navigate(`/games/${encodeURIComponent(game.name)}/support`)
+    When a game card is clicked, navigates to the GameSupportPage for that game.
+    encodeURIComponent handles special characters in game names (spaces, colons, etc.).
+
+  Game card displays:
+    - Cover image from RAWG background_image
+    - Game name and genres
+    - Rating count and star rating
+    - "Get Support" button
+
+--------------------------------------------------------------------------------
+FILE: src/pages/GameSupportPage.tsx
+--------------------------------------------------------------------------------
+PURPOSE:
+  The game-specific chatbot page. Accessible at /games/:gameName/support.
+  Users can ask anything about the selected game and get AI answers powered by
+  Reddit community data.
+
+KEY PARTS:
+
+  const { gameName } = useParams<{ gameName: string }>()
+    Extracts the game name from the URL parameter.
+
+  const decodedGameName = decodeURIComponent(gameName || '')
+    Decodes the URL-encoded game name back to readable text.
+
+  CATEGORIES array
+    Six category chips: Gameplay, Technical, Account, Billing, Community, Updates.
+    Each has a unique color scheme. Clicking a chip toggles it as the active category.
+    Clicking the same chip again deselects it (returns to null/general).
+
+  async function handleSend()
+    1. Takes the input text
+    2. Adds a user message to the chat history
+    3. Calls communityChat(question, decodedGameName, category) from api.ts
+    4. Adds the bot response to chat history
+    5. If the response includes posts[], renders Reddit source cards below the answer
+
+  Message rendering
+    - User messages: right-aligned, cyan background bubble
+    - Bot messages: left-aligned, dark background bubble with Bot icon
+    - Below bot messages: optional Reddit source cards showing subreddit, title,
+      score, comment count, and a link to the original post
+
+  Loading state
+    Shows a spinning loader with "Searching Reddit..." while waiting for response.
+
+  Input area
+    Sticky at bottom of viewport. Enter key (without Shift) submits the message.
+    Send button disabled when input is empty or loading.
+
+--------------------------------------------------------------------------------
+FILE: src/pages/FAQPage.tsx
+--------------------------------------------------------------------------------
+PURPOSE:
+  The main FAQ/help center page. Shows predefined popular questions and lets users
+  search or ask custom questions. Answers are powered by the /chat backend.
+
+KEY ADDITIONS (changes made during this session):
+
+  askBackend(question, category?)
+    Modified to accept an optional category parameter. This allows the function
+    to be called with a specific category rather than always using selectedCategory.
+
+  useEffect watching [selectedCategory]
+    When the user clicks a category chip in the FAQPage, this effect re-calls
+    askBackend with the current question and new category. This means:
+    - User selects "Witcher 3" from search
+    - AI gives a general answer
+    - User clicks "Gameplay" chip
+    - AI immediately re-answers focused only on gameplay
+    - User clicks "Technical" chip
+    - AI re-answers focused only on technical issues
+
+  Category chips (via CategoryGrid component)
+    gameplay, technical, account, billing, community, updates, general
+    Clicking a chip changes the selectedCategory state, which triggers the
+    useEffect above to re-fetch with the new category.
+
+================================================================================
+  DATA FLOW DIAGRAM
+================================================================================
+
+USER (FAQPage)                     USER (GameSupportPage)
+    |                                      |
+    | Types question                       | Selects game → clicks "Get Support"
+    |                                      | Types question + optional category chip
+    v                                      v
+ POST /chat                         POST /community/chat
+ { question, category }             { question, game_name, category }
+    |                                      |
+    v                                      v
+ extract_game_name()           extract_game_name(game_name)
+ (gpt-4o-mini extracts          (cleans up the game name)
+  game name from question)
+    |                                      |
+    v                                      v
+ is_franchise() (gpt-4o-mini) ←→ is_franchise() (gpt-4o-mini)
+    |                                      |
+    v                                      v
+ get_rawg_game_info()          get_rawg_game_info()
+ (1 game or 5 if franchise)    (1 game or 5 if franchise)
+    |
+    ├─── category == "updates" ───────────────────────────────────────────────┐
+    │    get_steam_app_id() for each game (parallel)                          │
+    │    get_steam_news() for each app ID (parallel)                          │
+    │    → adds Steam news to context                                         │
+    │                                                                         │
+    ├─── category in {gameplay, technical, community, general} ───────────────┤
+    │    fetch_reddit_posts() → Reddit API search                             │
+    │    store_posts_to_chromadb() → saves to ChromaDB for future use        │
+    │    vector_db.similarity_search() → retrieves relevant cached posts     │
+    │    → adds Reddit posts to context                                       │
+    │                                                                         │
+    └─── category in {account, billing} ─────────────────────────────────────┤
+         only RAWG metadata used as context                                   │
+         OpenAI uses its own training knowledge for account/billing policy   │
+    |                                                                         │
+    v                                                                         │
+ gpt-4o generates answer from all context ←──────────────────────────────────┘
+    |
+    v
+ { answer: "...", sources: [] }   /   { answer: "...", posts: [] }
+    |
+    v
+ Frontend renders answer in AI panel or chat bubble
+
+================================================================================
+  WHY CHROMADB SELF-BUILDS
+================================================================================
+
+Every time a user asks a question about a game in a Reddit-enabled category,
+the fetched Reddit posts are stored in ChromaDB with the game name and category
+as metadata filters. The next time anyone asks about the same game in the same
+category, ChromaDB already has relevant posts and can answer faster (and the
+Reddit API call still refreshes it with newer posts).
+
+This creates a knowledge base that grows over time without manual curation.
+The more questions users ask, the better the system gets at answering quickly.
+
+ChromaDB stores text as vector embeddings (numerical representations of meaning).
+Similarity search finds posts that are semantically similar to the question,
+not just keyword matches — so asking "how do i beat the final boss" finds posts
+about "tips for the endgame boss fight" even though the words are different.
+
+================================================================================
+  WHY FRANCHISE DETECTION
+================================================================================
+
+Some game names are franchise names (e.g. "Warhammer", "Call of Duty", "Dark Souls").
+Without franchise detection, RAWG would return just one game (the top result),
+which might not be what the user meant or might miss several relevant games.
+
+With franchise detection:
+  - RAWG returns the top 5 matching games
+  - For "updates" category: Steam news is fetched for ALL 5 games in parallel
+  - The AI gets context about the whole franchise, not just one title
+  - For "Warhammer", the user sees patch notes for Warhammer 40K: Space Marine,
+    Warhammer Vermintide 2, Total War: Warhammer, etc.
+
+asyncio.gather() runs all the Steam/Reddit API calls in parallel instead of
+waiting for each one sequentially, which is much faster.
+
+================================================================================
+  END OF SUMMARY
+================================================================================

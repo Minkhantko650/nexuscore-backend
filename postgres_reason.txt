@@ -1,0 +1,26 @@
+Why PostgreSQL is used in Docker
+==================================
+
+1. No local installation needed
+   - Without Docker, you would need to install PostgreSQL directly on your machine.
+   - With Docker, it runs in a container — clean, isolated, no setup hassle.
+
+2. Easy to start and stop
+   - Just run: docker-compose up -d
+   - PostgreSQL starts automatically alongside ChromaDB.
+
+3. Data persists across restarts
+   - We use a Docker volume (postgres_data) so your data is not lost when the container stops.
+
+4. Matches production environments
+   - Running PostgreSQL in Docker locally mirrors how it would run on a real server.
+   - Makes deployment easier and consistent.
+
+5. Isolated from other projects
+   - Each project can have its own PostgreSQL container with its own database, user, and password.
+   - No conflicts with other apps on your machine.
+
+6. Why PostgreSQL over SQLite
+   - SQLite is file-based and good for simple apps.
+   - PostgreSQL is production-grade, handles multiple users, concurrent requests, and large data better.
+   - Since we already use Docker for ChromaDB, adding PostgreSQL is straightforward.
