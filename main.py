@@ -90,6 +90,20 @@ async def reset_db():
     vector_db.delete_collection()
     return {"status": "cleared"}
 
+@app.get("/test-youtube")
+async def test_youtube():
+    import httpx, os
+    key = os.getenv("YOUTUBE_API_KEY")
+    if not key:
+        return {"error": "YOUTUBE_API_KEY not loaded", "key": None}
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={"key": key, "q": "witcher 3 gameplay", "part": "snippet", "type": "video", "maxResults": 2},
+            timeout=10,
+        )
+        return {"status": r.status_code, "body": r.json()}
+
 @app.post("/document")
 async def document(doc:Document):
     vector_db.add_texts(

@@ -2,3 +2,15 @@ fastapi
 uvicorn[standard]
 chromadb-client
 httpx
+openai
+python-dotenv
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt==4.3.0
+sqlalchemy
+psycopg2-binary
+langchain-chroma
+langchain-openai
+langchain-text-splitters
+PyPDF2
+python-multipart
